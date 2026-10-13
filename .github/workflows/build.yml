@@ -1,0 +1,97 @@
+name: build
+on:
+  workflow_dispatch:
+    inputs:
+      only:
+        description: "space-separated task ids (empty = all of tasks.txt)"
+        required: false
+        default: ""
+permissions:
+  contents: read
+  packages: write
+env:
+  HF_REV: 3c63c8b059d734fe74f932101f44dd0b16e7ee26
+  TAR_SHA256: 7ecd4d7a08bd766fa149ce123e31271323272f7fda1bf7c34cc872592f013f80
+  IMAGE: ghcr.io/gordonhu608/fineenvs-tasksmith
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    outputs:
+      tasks: ${{ steps.t.outputs.tasks }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: t
+        env:
+          ONLY: ${{ github.event.inputs.only }}
+        run: |
+          if [ -n "$ONLY" ]; then printf '%s\n' $ONLY > sel.txt; else cp tasks.txt sel.txt; fi
+          grep -vxE 'tasksmith-[0-9a-f]{12}' sel.txt && { echo "bad task id"; exit 1; } || true
+          echo "tasks=$(python3 -c 'import json; print(json.dumps(open("sel.txt").read().split()))')" >> "$GITHUB_OUTPUT"
+  build:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 20
+      matrix:
+        task: ${{ fromJson(needs.plan.outputs.tasks) }}
+    steps:
+      - name: free disk
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - name: fetch the task's two build contexts (pinned revision, checked sha256)
+        run: |
+          curl -fsSL --retry 5 -o tasks.tar.gz "https://huggingface.co/datasets/FineEnvs/HF_ML_Tasksmith/resolve/$HF_REV/tasks.tar.gz"
+          echo "$TAR_SHA256  tasks.tar.gz" | sha256sum -c -
+          tar -xzf tasks.tar.gz "tasks/${{ matrix.task }}/environment" "tasks/${{ matrix.task }}/tests"
+          rm tasks.tar.gz
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: build and push
+        env:
+          T: ${{ matrix.task }}
+          SRC: https://github.com/${{ github.repository }}
+        run: |
+          mkdir -p digests
+          for kind in env verifier; do
+            ctx=tasks/$T/environment; [ $kind = verifier ] && ctx=tasks/$T/tests
+            docker buildx build --platform linux/amd64 --push --provenance=false \
+              --label org.opencontainers.image.source=$SRC \
+              --label org.opencontainers.image.description="FineEnvs HF_ML_Tasksmith $T ($kind) @ $HF_REV" \
+              -t "$IMAGE:$T-$kind" --metadata-file "meta-$kind.json" "$ctx"
+          done
+          python3 - <<PY
+          import json
+          out = {k: "$IMAGE:$T-" + k + "@" + json.load(open(f"meta-{k}.json"))["containerimage.digest"] for k in ("env", "verifier")}
+          json.dump(out, open("digests/$T.json", "w"))
+          print(out)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.task }}
+          path: digests/${{ matrix.task }}.json
+  collect:
+    needs: build
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: digest-*
+          path: d
+          merge-multiple: true
+      - run: |
+          python3 - <<'PY'
+          import glob, json, os
+          images = {os.path.basename(p)[:-5]: json.load(open(p)) for p in sorted(glob.glob("d/*.json"))}
+          json.dump(images, open("images.json", "w"), indent=1)
+          print(len(images), "tasks")
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: images
+          path: images.json
